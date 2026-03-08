@@ -1,0 +1,1425 @@
+<?php
+// Important: Add access control
+session_start();
+
+// Database connection
+$servername = "localhost";
+$username = "student_2516";
+$password = "pass2516";
+$dbname = "student_2516";
+
+// Create connection
+$conn = new mysqli($servername, $username, $password, $dbname);
+
+// Check connection
+if ($conn->connect_error) {
+    die("Connection failed: " . $conn->connect_error);
+}
+
+// Set charset to UTF-8
+$conn->set_charset("utf8mb4");
+
+// Safe function to get tables from database
+function getTables($conn) {
+    $tables = array();
+    if ($result = $conn->query("SHOW TABLES")) {
+        while($row = $result->fetch_array()) {
+            $tables[] = $row[0];
+        }
+        $result->free();
+    }
+    return $tables;
+}
+
+// Safe function to get table data
+function getTableData($conn, $tableName) {
+    $data = array();
+    
+    // Validate table name
+    if (!preg_match('/^[a-zA-Z0-9_]+$/', $tableName)) {
+        return array(
+            'name' => $tableName,
+            'columns' => array(),
+            'primaryKey' => array(),
+            'foreignKeys' => array(),
+            'data' => array(),
+            'error' => 'Invalid table name'
+        );
+    }
+    
+    // Get columns
+    $columns = array();
+    $columnTypes = array();
+    $stmt = $conn->prepare("SHOW COLUMNS FROM `$tableName`");
+    if ($stmt) {
+        $stmt->execute();
+        $result = $stmt->get_result();
+        while($row = $result->fetch_assoc()) {
+            $columns[] = $row['Field'];
+            $columnTypes[$row['Field']] = $row['Type'];
+        }
+        $stmt->close();
+    }
+    
+    // Get primary key
+    $primaryKeys = array();
+    $stmt = $conn->prepare("SHOW KEYS FROM `$tableName` WHERE Key_name = 'PRIMARY'");
+    if ($stmt) {
+        $stmt->execute();
+        $result = $stmt->get_result();
+        while($row = $result->fetch_assoc()) {
+            $primaryKeys[] = $row['Column_name'];
+        }
+        $stmt->close();
+    }
+    
+    // Get foreign keys
+    $foreignKeys = array();
+    $sql = "SELECT 
+                COLUMN_NAME,
+                REFERENCED_TABLE_NAME,
+                REFERENCED_COLUMN_NAME
+            FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+            WHERE TABLE_SCHEMA = DATABASE()
+            AND TABLE_NAME = ?
+            AND REFERENCED_TABLE_NAME IS NOT NULL";
+    
+    $stmt = $conn->prepare($sql);
+    if ($stmt) {
+        $stmt->bind_param("s", $tableName);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        while($row = $result->fetch_assoc()) {
+            $foreignKeys[] = array(
+                'column' => $row['COLUMN_NAME'],
+                'referenced_table' => $row['REFERENCED_TABLE_NAME'],
+                'referenced_column' => $row['REFERENCED_COLUMN_NAME']
+            );
+        }
+        $stmt->close();
+    }
+    
+    // Get data
+    $rows = array();
+    $stmt = $conn->prepare("SELECT * FROM `$tableName`");
+    if ($stmt) {
+        $stmt->execute();
+        $result = $stmt->get_result();
+        while($row = $result->fetch_assoc()) {
+            $rows[] = $row;
+        }
+        $stmt->close();
+    }
+    
+    return array(
+        'name' => $tableName,
+        'columns' => $columns,
+        'columnTypes' => $columnTypes,
+        'primaryKey' => $primaryKeys,
+        'foreignKeys' => $foreignKeys,
+        'data' => $rows,
+        'count' => count($rows)
+    );
+}
+
+// Process POST requests
+if ($_SERVER['REQUEST_METHOD'] == 'POST') {
+    $action = $_POST['action'] ?? '';
+    $tableName = $_POST['table'] ?? '';
+    
+    // Validate table name
+    if (!preg_match('/^[a-zA-Z0-9_]+$/', $tableName)) {
+        http_response_code(400);
+        echo json_encode(array('success' => false, 'message' => 'Invalid table name'));
+        exit;
+    }
+    
+    switch ($action) {
+        case 'get_table':
+            $tableData = getTableData($conn, $tableName);
+            header('Content-Type: application/json');
+            echo json_encode($tableData);
+            exit;
+            
+        case 'search':
+            $searchValue = $_POST['search'] ?? '';
+            $searchType = $_POST['searchType'] ?? 'all'; // 'all', 'pk', 'fk', 'name'
+            
+            $tableData = getTableData($conn, $tableName);
+            
+            if (!empty($searchValue)) {
+                $whereClauses = array();
+                $params = array();
+                $types = '';
+                
+                $searchTerm = '%' . trim($searchValue) . '%';
+                
+                if ($searchType === 'all') {
+                    // Search in ALL columns
+                    foreach ($tableData['columns'] as $col) {
+                        $whereClauses[] = "`$col` LIKE ?";
+                        $params[] = $searchTerm;
+                        $types .= 's';
+                    }
+                } elseif ($searchType === 'pk') {
+                    // Search in primary keys only
+                    foreach ($tableData['primaryKey'] as $pk) {
+                        $whereClauses[] = "`$pk` LIKE ?";
+                        $params[] = $searchTerm;
+                        $types .= 's';
+                    }
+                } elseif ($searchType === 'fk') {
+                    // Search in foreign keys only
+                    foreach ($tableData['foreignKeys'] as $fk) {
+                        $whereClauses[] = "`{$fk['column']}` LIKE ?";
+                        $params[] = $searchTerm;
+                        $types .= 's';
+                    }
+                } elseif ($searchType === 'name') {
+                    // Search in name-related columns
+                    foreach ($tableData['columns'] as $col) {
+                        $colLower = strtolower($col);
+                        if (strpos($colLower, 'name') !== false || 
+                            strpos($colLower, 'onoma') !== false ||
+                            strpos($colLower, 'epitheto') !== false ||
+                            strpos($colLower, 'surname') !== false ||
+                            strpos($colLower, 'firstname') !== false ||
+                            strpos($colLower, 'lastname') !== false) {
+                            $whereClauses[] = "`$col` LIKE ?";
+                            $params[] = $searchTerm;
+                            $types .= 's';
+                        }
+                    }
+                }
+                
+                if (count($whereClauses) > 0) {
+                    $where = implode(' OR ', $whereClauses);
+                    $sql = "SELECT * FROM `$tableName` WHERE $where";
+                    
+                    $stmt = $conn->prepare($sql);
+                    if ($stmt) {
+                        if ($types) {
+                            $stmt->bind_param($types, ...$params);
+                        }
+                        $stmt->execute();
+                        $result = $stmt->get_result();
+                        
+                        $filteredData = array();
+                        while($row = $result->fetch_assoc()) {
+                            $filteredData[] = $row;
+                        }
+                        
+                        $tableData['data'] = $filteredData;
+                        $tableData['count'] = count($filteredData);
+                        $stmt->close();
+                    }
+                }
+            }
+            
+            header('Content-Type: application/json');
+            echo json_encode($tableData);
+            exit;
+            
+        case 'save':
+            $operation = $_POST['operation'] ?? 'insert';
+            $rawData = $_POST['data'] ?? '';
+            
+            if (empty($rawData)) {
+                echo json_encode(array('success' => false, 'message' => 'No data provided'));
+                exit;
+            }
+            
+            $data = json_decode($rawData, true);
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                echo json_encode(array('success' => false, 'message' => 'Invalid JSON data'));
+                exit;
+            }
+            
+            if ($operation == 'insert') {
+                $columns = array();
+                $placeholders = array();
+                $values = array();
+                $types = '';
+                
+                foreach ($data as $key => $value) {
+                    if (!preg_match('/^[a-zA-Z0-9_]+$/', $key)) {
+                        continue;
+                    }
+                    $columns[] = "`$key`";
+                    $placeholders[] = "?";
+                    $values[] = $value;
+                    $types .= 's';
+                }
+                
+                if (empty($columns)) {
+                    echo json_encode(array('success' => false, 'message' => 'No valid columns'));
+                    exit;
+                }
+                
+                $columnsStr = implode(', ', $columns);
+                $placeholdersStr = implode(', ', $placeholders);
+                
+                $sql = "INSERT INTO `$tableName` ($columnsStr) VALUES ($placeholdersStr)";
+                $stmt = $conn->prepare($sql);
+                
+                if ($stmt) {
+                    $stmt->bind_param($types, ...$values);
+                    if ($stmt->execute()) {
+                        echo json_encode(array('success' => true, 'message' => 'Record added successfully', 'insert_id' => $stmt->insert_id));
+                    } else {
+                        echo json_encode(array('success' => false, 'message' => 'Error: ' . $stmt->error));
+                    }
+                    $stmt->close();
+                } else {
+                    echo json_encode(array('success' => false, 'message' => 'Error preparing statement'));
+                }
+            }
+            elseif ($operation == 'update') {
+                $tableData = getTableData($conn, $tableName);
+                $primaryKeys = $tableData['primaryKey'];
+                
+                if (empty($primaryKeys)) {
+                    echo json_encode(array('success' => false, 'message' => 'Table has no primary key'));
+                    exit;
+                }
+                
+                $setClauses = array();
+                $whereClauses = array();
+                $values = array();
+                $types = '';
+                
+                foreach ($data as $key => $value) {
+                    if (!preg_match('/^[a-zA-Z0-9_]+$/', $key)) {
+                        continue;
+                    }
+                    
+                    if (in_array($key, $primaryKeys)) {
+                        $whereClauses[] = "`$key` = ?";
+                    } else {
+                        $setClauses[] = "`$key` = ?";
+                    }
+                    $values[] = $value;
+                    $types .= 's';
+                }
+                
+                if (empty($setClauses)) {
+                    echo json_encode(array('success' => false, 'message' => 'No fields to update'));
+                    exit;
+                }
+                
+                if (empty($whereClauses)) {
+                    echo json_encode(array('success' => false, 'message' => 'Primary key values required for update'));
+                    exit;
+                }
+                
+                $reorderedValues = array();
+                foreach ($data as $key => $value) {
+                    if (!in_array($key, $primaryKeys)) {
+                        $reorderedValues[] = $value;
+                    }
+                }
+                foreach ($data as $key => $value) {
+                    if (in_array($key, $primaryKeys)) {
+                        $reorderedValues[] = $value;
+                    }
+                }
+                
+                $setStr = implode(', ', $setClauses);
+                $whereStr = implode(' AND ', $whereClauses);
+                
+                $sql = "UPDATE `$tableName` SET $setStr WHERE $whereStr";
+                $stmt = $conn->prepare($sql);
+                
+                if ($stmt) {
+                    $stmt->bind_param($types, ...$reorderedValues);
+                    if ($stmt->execute()) {
+                        echo json_encode(array('success' => true, 'message' => 'Record updated successfully', 'affected_rows' => $stmt->affected_rows));
+                    } else {
+                        echo json_encode(array('success' => false, 'message' => 'Error: ' . $stmt->error));
+                    }
+                    $stmt->close();
+                } else {
+                    echo json_encode(array('success' => false, 'message' => 'Error preparing statement'));
+                }
+            }
+            exit;
+            
+        case 'delete':
+            $rawData = $_POST['data'] ?? '';
+            
+            if (empty($rawData)) {
+                echo json_encode(array('success' => false, 'message' => 'No data provided'));
+                exit;
+            }
+            
+            $data = json_decode($rawData, true);
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                echo json_encode(array('success' => false, 'message' => 'Invalid JSON data'));
+                exit;
+            }
+            
+            $tableData = getTableData($conn, $tableName);
+            $primaryKeys = $tableData['primaryKey'];
+            
+            if (empty($primaryKeys)) {
+                echo json_encode(array('success' => false, 'message' => 'Table has no primary key'));
+                exit;
+            }
+            
+            $whereClauses = array();
+            $values = array();
+            $types = '';
+            
+            foreach ($primaryKeys as $pk) {
+                if (isset($data[$pk])) {
+                    $whereClauses[] = "`$pk` = ?";
+                    $values[] = $data[$pk];
+                    $types .= 's';
+                }
+            }
+            
+            if (count($whereClauses) == 0) {
+                echo json_encode(array('success' => false, 'message' => 'Primary key values required for delete'));
+                exit;
+            }
+            
+            $whereStr = implode(' AND ', $whereClauses);
+            $sql = "DELETE FROM `$tableName` WHERE $whereStr";
+            $stmt = $conn->prepare($sql);
+            
+            if ($stmt) {
+                $stmt->bind_param($types, ...$values);
+                if ($stmt->execute()) {
+                    echo json_encode(array('success' => true, 'message' => 'Record deleted successfully', 'affected_rows' => $stmt->affected_rows));
+                } else {
+                    echo json_encode(array('success' => false, 'message' => 'Error: ' . $stmt->error));
+                }
+                $stmt->close();
+            } else {
+                echo json_encode(array('success' => false, 'message' => 'Error preparing statement'));
+            }
+            exit;
+            
+        default:
+            http_response_code(400);
+            echo json_encode(array('success' => false, 'message' => 'Invalid action'));
+            exit;
+    }
+}
+
+// Get tables for sidebar
+$tables = getTables($conn);
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tax Management System EFORIA7</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        .header {
+            background: white;
+            padding: 20px 40px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            margin-bottom: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        
+        .header h1 {
+            color: #1e3c72;
+            font-size: 28px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        
+        .logo {
+            width: 50px;
+            height: 50px;
+            background: linear-gradient(135deg, #1e3c72, #2a5298);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 24px;
+        }
+        
+        .homeBtn {
+            background: #28a745;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 6px;
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 600;
+            transition: all 0.3s;
+            border: none;
+            cursor: pointer;
+        }
+        
+        .homeBtn:hover {
+            background: #218838;
+            transform: translateY(-2px);
+        }
+        
+        .mainContent {
+            display: grid;
+            grid-template-columns: 300px 1fr;
+            gap: 20px;
+        }
+        
+        .sidebar {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            height: fit-content;
+        }
+        
+        .sidebar h3 {
+            color: #1e3c72;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #1e3c72;
+        }
+        
+        .tableList {
+            list-style: none;
+            max-height: 500px;
+            overflow-y: auto;
+        }
+        
+        .tableList li {
+            padding: 12px;
+            margin: 8px 0;
+            background: #f5f7fa;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.3s;
+            border-left: 3px solid transparent;
+        }
+        
+        .tableList li:hover {
+            background: #e8f0fe;
+            border-left-color: #2a5298;
+            transform: translateX(5px);
+        }
+        
+        .tableList li.active {
+            background: #1e3c72;
+            color: white;
+            border-left-color: #ffd700;
+        }
+        
+        .tableName {
+            font-weight: 600;
+        }
+        
+        .contentArea {
+            background: white;
+            border-radius: 10px;
+            padding: 30px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            min-height: 600px;
+        }
+        
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 25px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        
+        .searchBox {
+            flex: 1;
+            min-width: 300px;
+        }
+        
+        .searchBox input {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 6px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+        
+        .searchBox input:focus {
+            outline: none;
+            border-color: #2a5298;
+        }
+        
+        .searchTypeSelector {
+            display: flex;
+            gap: 5px;
+            background: #f5f7fa;
+            padding: 5px;
+            border-radius: 6px;
+        }
+        
+        .searchTypeBtn {
+            padding: 8px 15px;
+            border: none;
+            background: transparent;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+            transition: all 0.3s;
+            color: #666;
+        }
+        
+        .searchTypeBtn.active {
+            background: #1e3c72;
+            color: white;
+        }
+        
+        .searchTypeBtn:hover:not(.active) {
+            background: #e0e0e0;
+        }
+        
+        .btn {
+            padding: 12px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: all 0.3s;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .btnPrimary {
+            background: #1e3c72;
+            color: white;
+        }
+        
+        .btnPrimary:hover {
+            background: #2a5298;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(30,60,114,0.3);
+        }
+        
+        .btnSuccess {
+            background: #28a745;
+            color: white;
+        }
+        
+        .btnSuccess:hover {
+            background: #218838;
+        }
+        
+        .btnDanger {
+            background: #dc3545;
+            color: white;
+        }
+        
+        .btnDanger:hover {
+            background: #c82333;
+        }
+        
+        .tableContainer {
+            overflow-x: auto;
+            margin-top: 20px;
+            max-height: 500px;
+            overflow-y: auto;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+        }
+        
+        thead {
+            background: linear-gradient(135deg, #1e3c72, #2a5298);
+            color: white;
+            position: sticky;
+            top: 0;
+        }
+        
+        th {
+            padding: 15px;
+            text-align: left;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        
+        td {
+            padding: 12px 15px;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        
+        tbody tr {
+            transition: background 0.2s;
+        }
+        
+        tbody tr:hover {
+            background: #f8f9fa;
+        }
+        
+        .pkBadge {
+            background: #ffd700;
+            color: #333;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: bold;
+            margin-left: 5px;
+        }
+        
+        .fkBadge {
+            background: #17a2b8;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: bold;
+            margin-left: 5px;
+        }
+        
+        .actionBtns {
+            display: flex;
+            gap: 5px;
+            justify-content: center;
+        }
+        
+        .editBtn, .deleteBtn {
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            padding: 6px 10px;
+        }
+        
+        .editBtn {
+            background: #ffc107;
+            color: #333;
+        }
+        
+        .editBtn:hover {
+            background: #e0a800;
+        }
+        
+        .deleteBtn {
+            background: #dc3545;
+            color: white;
+        }
+        
+        .deleteBtn:hover {
+            background: #c82333;
+        }
+        
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.6);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+        
+        .modal.active {
+            display: flex;
+        }
+        
+        .modalContent {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            max-width: 600px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+        }
+        
+        .modalHeader {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 25px;
+            padding-bottom: 15px;
+            border-bottom: 2px solid #e0e0e0;
+        }
+        
+        .modalHeader h2 {
+            color: #1e3c72;
+            font-size: 24px;
+        }
+        
+        .closeBtn {
+            background: none;
+            border: none;
+            font-size: 28px;
+            cursor: pointer;
+            color: #999;
+        }
+        
+        .closeBtn:hover {
+            color: #333;
+        }
+        
+        .formGroup {
+            margin-bottom: 20px;
+        }
+        
+        .formGroup label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 600;
+        }
+        
+        .formGroup input {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        
+        .formGroup input:focus {
+            outline: none;
+            border-color: #2a5298;
+        }
+        
+        .formGroup input[readonly] {
+            background: #f5f5f5;
+            color: #666;
+            cursor: not-allowed;
+        }
+        
+        .welcomeScreen {
+            text-align: center;
+            padding: 40px 20px;
+        }
+        
+        .welcomeScreen h2 {
+            color: #1e3c72;
+            font-size: 32px;
+            margin-bottom: 20px;
+        }
+        
+        .infoBox {
+            background: #e8f0fe;
+            border-left: 4px solid #2a5298;
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            text-align: left;
+        }
+        
+        .notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 15px 25px;
+            border-radius: 6px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            z-index: 2000;
+            display: none;
+        }
+        
+        .notification.success {
+            background: #28a745;
+            color: white;
+        }
+        
+        .notification.error {
+            background: #dc3545;
+            color: white;
+        }
+        
+        .notification.warning {
+            background: #ffc107;
+            color: #333;
+        }
+        
+        .notification.show {
+            display: block;
+            animation: slideIn 0.3s;
+        }
+        
+        @keyframes slideIn {
+            from { transform: translateX(400px); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #3498db;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 10px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .noData {
+            text-align: center;
+            padding: 40px;
+            color: #999;
+            font-size: 16px;
+        }
+        
+        @media (max-width: 768px) {
+            .mainContent {
+                grid-template-columns: 1fr;
+            }
+            
+            .controls {
+                flex-direction: column;
+            }
+            
+            .searchBox {
+                min-width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>
+                <div class="logo">E7</div>
+                Tax Management System EFORIA7
+            </h1>
+            <button class="homeBtn" onclick="showWelcomeScreen()">
+                Arxiki Selida
+            </button>
+        </div>
+        
+        <div class="mainContent">
+            <div class="sidebar">
+                <h3>Diathesimoi Pinakes</h3>
+                <ul class="tableList" id="tableList">
+                    <?php foreach ($tables as $table): 
+                        $displayName = str_replace('_', ' ', $table);
+                        $displayName = ucwords($displayName);
+                    ?>
+                        <li onclick="selectTable('<?php echo htmlspecialchars($table); ?>')">
+                            <div class="tableName"><?php echo htmlspecialchars($displayName); ?></div>
+                        </li>
+                    <?php endforeach; ?>
+                </ul>
+            </div>
+            
+            <div class="contentArea">
+                <div id="welcomeScreen" class="welcomeScreen">
+                    <h2>Kalos irthate sto Tax Management System EFORIA7</h2>
+                    <p>Epilexte enan pinaka apo tin pleuriki mpara gia na xekinisete</p>
+                    
+                    <div class="infoBox">
+                        <strong>Odigies Xrisis:</strong><br>
+                        1. Epilexte pinaka apo tin aristeri pleyra<br>
+                        2. Xrisimopoiiste tin anazitisi gia eyresi eggrafon se oles tis stiles<br>
+                        3. Patiste "Epexergasia" i "Diagrafi" gia diaxeirisi eggrafon
+                    </div>
+                </div>
+                
+                <div id="tableView" style="display: none;">
+                    <div class="tableTitle">
+                        <h2 id="currentTableTitle"></h2>
+                    </div>
+                    
+                    <div class="controls">
+                        <div class="searchBox">
+                            <input type="text" id="searchInput" placeholder="Anazitisi...">
+                        </div>
+                        
+                        <button class="btn btnPrimary" onclick="searchTable()" id="searchBtn">
+                            Anazitisi
+                        </button>
+                        <button class="btn btnSuccess" onclick="showAddModal()">
+                            Prosthiki Eggrafis
+                        </button>
+                    </div>
+                    
+                    <div class="infoBox" id="searchInfo" style="display: none;">
+                        Emfanisi <span id="resultCount">0</span> apo <span id="totalCount">0</span> synolikes egrafes
+                    </div>
+                    
+                    <div class="tableContainer">
+                        <table id="dataTable">
+                            <thead id="tableHead"></thead>
+                            <tbody id="tableBody"></tbody>
+                        </table>
+                    </div>
+                    
+                    <div id="loadingSpinner" style="display: none; text-align: center; padding: 20px;">
+                        <div class="loading"></div> Fortosi dedomenon...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Modal for Add/Edit -->
+    <div id="modal" class="modal">
+        <div class="modalContent">
+            <div class="modalHeader">
+                <h2 id="modalTitle">Prosthiki Neas Eggrafis</h2>
+                <button class="closeBtn" onclick="closeModal()">&times;</button>
+            </div>
+            <div id="modalForm"></div>
+            <div style="display: flex; gap: 10px; margin-top: 25px;">
+                <button class="btn btnSuccess" onclick="saveRecord()" id="saveBtn" style="flex: 1;">
+                    Apothikefsi
+                </button>
+                <button class="btn btnDanger" onclick="closeModal()" style="flex: 1;">
+                    Akyrosi
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Notification -->
+    <div id="notification" class="notification"></div>
+    
+    <script>
+        let currentTable = null;
+        let editingRecord = null;
+        let currentSearchResults = null;
+        let currentTableData = null;
+        
+        // Show welcome screen
+        function showWelcomeScreen() {
+            document.getElementById('welcomeScreen').style.display = 'block';
+            document.getElementById('tableView').style.display = 'none';
+            document.querySelectorAll('.tableList li').forEach(li => li.classList.remove('active'));
+        }
+        
+        // Select table
+        function selectTable(tableName) {
+            currentTable = tableName;
+            currentSearchResults = null;
+            
+            let displayName = tableName.replace(/_/g, ' ');
+            displayName = displayName.split(' ').map(word => 
+                word.charAt(0).toUpperCase() + word.slice(1)
+            ).join(' ');
+            
+            document.getElementById('welcomeScreen').style.display = 'none';
+            document.getElementById('tableView').style.display = 'block';
+            document.getElementById('currentTableTitle').textContent = displayName;
+            document.getElementById('searchInput').value = '';
+            document.getElementById('searchInfo').style.display = 'none';
+            
+            document.querySelectorAll('.tableList li').forEach(li => li.classList.remove('active'));
+            event.currentTarget.classList.add('active');
+            
+            loadTableData();
+        }
+        
+        // Load table data
+        function loadTableData() {
+            if (!currentTable) return;
+            
+            showLoading(true);
+            
+            const formData = new FormData();
+            formData.append('action', 'get_table');
+            formData.append('table', currentTable);
+            
+            fetch('', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    showNotification(data.error, 'error');
+                    return;
+                }
+                
+                currentTableData = data;
+                renderTable(data.data);
+                showLoading(false);
+            })
+            .catch(error => {
+                showNotification('Sfalma kata ti fortosi dedomenon', 'error');
+                console.error('Error:', error);
+                showLoading(false);
+            });
+        }
+        
+        // Search table
+        function searchTable() {
+            if (!currentTableData) return;
+            
+            const searchValue = document.getElementById('searchInput').value.trim();
+            if (!searchValue) {
+                showNotification('Parakalo eisagete oro anazitisis', 'warning');
+                return;
+            }
+            
+            showLoading(true);
+            
+            const formData = new FormData();
+            formData.append('action', 'search');
+            formData.append('table', currentTable);
+            formData.append('search', searchValue);
+            formData.append('searchType', 'all');
+            
+            fetch('', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    showNotification(data.error, 'error');
+                    showLoading(false);
+                    return;
+                }
+                
+                currentTableData = data;
+                currentSearchResults = data.data;
+                renderTable(data.data);
+                showLoading(false);
+                
+                const searchInfo = document.getElementById('searchInfo');
+                const resultCount = document.getElementById('resultCount');
+                const totalCount = document.getElementById('totalCount');
+                
+                resultCount.textContent = data.data.length;
+                totalCount.textContent = data.count;
+                searchInfo.style.display = 'block';
+                
+                showNotification('Vrethikan ' + data.data.length + ' egrafes', 'success');
+            })
+            .catch(error => {
+                showNotification('Sfalma anazitisis', 'error');
+                console.error('Error:', error);
+                showLoading(false);
+            });
+        }
+        
+        // Render table
+        function renderTable(data) {
+            if (!currentTableData) return;
+            
+            const thead = document.getElementById('tableHead');
+            const tbody = document.getElementById('tableBody');
+            
+            thead.innerHTML = '';
+            tbody.innerHTML = '';
+            
+            const headerRow = document.createElement('tr');
+            
+            currentTableData.columns.forEach(col => {
+                const th = document.createElement('th');
+                th.textContent = col;
+                
+                if (currentTableData.primaryKey.includes(col)) {
+                    th.innerHTML += '<span class="pkBadge">PK</span>';
+                }
+                
+                const fkInfo = currentTableData.foreignKeys.find(fk => fk.column === col);
+                if (fkInfo) {
+                    th.innerHTML += '<span class="fkBadge">FK</span>';
+                }
+                
+                headerRow.appendChild(th);
+            });
+            
+            const actionTh = document.createElement('th');
+            actionTh.textContent = 'Energeies';
+            actionTh.style.textAlign = 'center';
+            headerRow.appendChild(actionTh);
+            thead.appendChild(headerRow);
+            
+            if (!data || data.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="' + (currentTableData.columns.length + 1) + '" class="noData">Den yparchoun dedomena</td></tr>';
+                return;
+            }
+            
+            data.forEach((record, index) => {
+                const row = document.createElement('tr');
+                
+                currentTableData.columns.forEach(col => {
+                    const td = document.createElement('td');
+                    let value = record[col];
+                    if (value === null || value === undefined) {
+                        value = 'NULL';
+                        td.style.color = '#999';
+                        td.style.fontStyle = 'italic';
+                    }
+                    td.textContent = value;
+                    row.appendChild(td);
+                });
+                
+                const actionTd = document.createElement('td');
+                actionTd.style.textAlign = 'center';
+                actionTd.innerHTML = `
+                    <div class="actionBtns">
+                        <button class="editBtn" onclick="editRecord(${index})">
+                            Epexergasia
+                        </button>
+                        <button class="deleteBtn" onclick="deleteRecord(${index})">
+                            Diagrafi
+                        </button>
+                    </div>
+                `;
+                row.appendChild(actionTd);
+                tbody.appendChild(row);
+            });
+        }
+        
+        // Show modal for new record
+        function showAddModal() {
+            if (!currentTableData) return;
+            
+            editingRecord = null;
+            let displayName = currentTable.replace(/_/g, ' ');
+            displayName = displayName.split(' ').map(word => 
+                word.charAt(0).toUpperCase() + word.slice(1)
+            ).join(' ');
+            
+            document.getElementById('modalTitle').textContent = 'Prosthiki Neas Eggrafis - ' + displayName;
+            generateForm();
+            document.getElementById('modal').classList.add('active');
+        }
+        
+        // Edit record
+        function editRecord(index) {
+            if (!currentTableData) return;
+            
+            const dataSource = currentSearchResults || currentTableData.data;
+            editingRecord = dataSource[index];
+            
+            let displayName = currentTable.replace(/_/g, ' ');
+            displayName = displayName.split(' ').map(word => 
+                word.charAt(0).toUpperCase() + word.slice(1)
+            ).join(' ');
+            
+            document.getElementById('modalTitle').textContent = 'Epexergasia Eggrafis - ' + displayName;
+            generateForm(editingRecord);
+            document.getElementById('modal').classList.add('active');
+        }
+        
+        // Generate form
+        function generateForm(record = null) {
+            if (!currentTableData) return;
+            
+            const form = document.getElementById('modalForm');
+            form.innerHTML = '';
+            
+            currentTableData.columns.forEach(col => {
+                const formGroup = document.createElement('div');
+                formGroup.className = 'formGroup';
+                
+                const label = document.createElement('label');
+                label.textContent = col;
+                
+                if (currentTableData.primaryKey.includes(col)) {
+                    label.innerHTML += ' <span class="pkBadge">PK</span>';
+                }
+                
+                const fkInfo = currentTableData.foreignKeys.find(fk => fk.column === col);
+                if (fkInfo) {
+                    label.innerHTML += ' <span class="fkBadge">FK -> ' + fkInfo.referenced_table + '</span>';
+                }
+                
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.id = 'input_' + col;
+                input.placeholder = 'Eisagete timi gia ' + col;
+                
+                if (record) {
+                    input.value = record[col] === null ? '' : record[col];
+                    if (currentTableData.primaryKey.includes(col)) {
+                        input.readOnly = true;
+                        input.title = 'To protevon kleidi den mporei na tropopoiithei';
+                    }
+                }
+                
+                formGroup.appendChild(label);
+                formGroup.appendChild(input);
+                form.appendChild(formGroup);
+            });
+        }
+        
+        // Save record
+        function saveRecord() {
+            if (!currentTableData) return;
+            
+            const formDataObj = {};
+            let hasData = false;
+            
+            currentTableData.columns.forEach(col => {
+                const input = document.getElementById('input_' + col);
+                if (input) {
+                    formDataObj[col] = input.value.trim();
+                    hasData = true;
+                }
+            });
+            
+            if (!hasData) {
+                showNotification('Den yparchoun dedomena gia apothikefsi', 'warning');
+                return;
+            }
+            
+            const saveBtn = document.getElementById('saveBtn');
+            saveBtn.disabled = true;
+            saveBtn.innerHTML = '<span class="loading"></span> Apothikefsi...';
+            
+            const formData = new FormData();
+            formData.append('action', 'save');
+            formData.append('table', currentTable);
+            formData.append('operation', editingRecord ? 'update' : 'insert');
+            formData.append('data', JSON.stringify(formDataObj));
+            
+            fetch('', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showNotification(data.message, 'success');
+                    closeModal();
+                    loadTableData();
+                } else {
+                    showNotification(data.message, 'error');
+                }
+            })
+            .catch(error => {
+                showNotification('Sfalma kata tin apothikefsi', 'error');
+                console.error('Error:', error);
+            })
+            .finally(() => {
+                saveBtn.disabled = false;
+                saveBtn.textContent = 'Apothikefsi';
+            });
+        }
+        
+        // Delete record
+        function deleteRecord(index) {
+            if (!confirm('Eiste sigouroi oti thelete na diagrapsete aftin tin eggrafi')) {
+                return;
+            }
+            
+            const dataSource = currentSearchResults || currentTableData.data;
+            const recordToDelete = dataSource[index];
+            
+            const formData = new FormData();
+            formData.append('action', 'delete');
+            formData.append('table', currentTable);
+            formData.append('data', JSON.stringify(recordToDelete));
+            
+            fetch('', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showNotification(data.message, 'success');
+                    loadTableData();
+                } else {
+                    showNotification(data.message, 'error');
+                }
+            })
+            .catch(error => {
+                showNotification('Sfalma kata ti diagrafi', 'error');
+                console.error('Error:', error);
+            });
+        }
+        
+        // Close modal
+        function closeModal() {
+            document.getElementById('modal').classList.remove('active');
+            editingRecord = null;
+        }
+        
+        // Show notification
+        function showNotification(message, type) {
+            const notification = document.getElementById('notification');
+            notification.textContent = message;
+            notification.className = 'notification ' + type + ' show';
+            
+            setTimeout(() => {
+                notification.classList.remove('show');
+            }, 3000);
+        }
+        
+        // Show loading
+        function showLoading(show) {
+            const spinner = document.getElementById('loadingSpinner');
+            const searchBtn = document.getElementById('searchBtn');
+            
+            if (show) {
+                spinner.style.display = 'block';
+                searchBtn.disabled = true;
+                searchBtn.innerHTML = '<span class="loading"></span> Anazitisi...';
+            } else {
+                spinner.style.display = 'none';
+                searchBtn.disabled = false;
+                searchBtn.textContent = 'Anazitisi';
+            }
+        }
+        
+        // Event Listeners
+        window.onclick = function(event) {
+            const modal = document.getElementById('modal');
+            if (event.target === modal) {
+                closeModal();
+            }
+        };
+        
+        document.getElementById('searchInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                searchTable();
+            }
+        });
+        
+        window.addEventListener('load', function() {
+            showWelcomeScreen();
+        });
+    </script>
+</body>
+</html>
+<?php
+$conn->close();
+?>
